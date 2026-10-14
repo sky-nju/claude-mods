@@ -1,0 +1,5 @@
+.DS_Store
+node_modules/
+# Claude Code 加载 mod 时自动生成的类型文件
+.claude-plugin/types/
+tsconfig.json

@@ -1,0 +1,7 @@
+{
+  "name": "red-pen",
+  "version": "0.1.0",
+  "description": "红笔批阅：在 Claude 的回答上逐段批「采纳 / 不要 / 啥意思 / 批注」，一键拼成「原文——批注」发出；长回答自动按规矩批一遍，问过的词记进看不懂词典",
+  "author": { "name": "Sky" },
+  "types": "./types/index.d.ts"
+}

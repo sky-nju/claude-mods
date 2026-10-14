@@ -1,0 +1,14 @@
+{
+  "name": "sky-mods",
+  "description": "Sky 做的 Claude Code mods：红笔批阅等",
+  "owner": {
+    "name": "Sky"
+  },
+  "plugins": [
+    {
+      "name": "red-pen",
+      "source": "./red-pen",
+      "description": "红笔批阅：在 Claude 的回答上逐段批「采纳 / 不要 / 啥意思 / 批注」，一键拼成「原文——批注」发出；长回答自动按规矩批一遍"
+    }
+  ]
+}
