@@ -28,9 +28,19 @@ const REPLY = [
   '```',
 ].join('\n')
 
-const LONG = `这批 cohort 的留存在第 3 天掉得最多。${'后面是很长的分析，'.repeat(40)}`
+const LONG = `这批 cohort 的留存在第 3 天掉得最多。${'后面是很长的分析，'.repeat(100)}`
 
 const USAGE = { input_tokens: 10, output_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+
+// /redpen 面板：停靠在对话旁边
+const PANE_PROPS = {
+  title: '红笔批阅',
+  isFocused: false,
+  bodyColumns: 60,
+  placement: 'dock' as const,
+  scroll: { offset: 0, bodyRows: 30 },
+  view: {},
+}
 
 // 一次系统提示的组装：主模型、桌面端、没有工具
 const COMPOSE = {
@@ -52,8 +62,13 @@ const BAND_PROPS = {
 }
 
 // 插件下面的世界：时钟、存储、文件、模型、提交出去的话都记在 sent 里
-// noHaiku：模拟同事的环境里调不到小模型
-function world(on: On, store: Record<string, unknown> = {}, opts: { noHaiku?: boolean } = {}) {
+// noHaiku：调不到小模型；noSubmit：消息发不出去；noFork：「啥意思」问不到；
+// whileQueued：消息排队、还没发出去的那段时间里要做的事（像 Claude 正在回答时那样）
+function world(
+  on: On,
+  store: Record<string, unknown> = {},
+  opts: { noHaiku?: boolean; noSubmit?: boolean; noFork?: boolean; whileQueued?: () => Promise<void> } = {},
+) {
   const clock = mock.clock(on, { now: Date.UTC(2026, 9, 14, 2) })
   mock.store(on, store)
   const sent: string[] = []
@@ -63,13 +78,18 @@ function world(on: On, store: Record<string, unknown> = {}, opts: { noHaiku?: bo
   on('fs.read', () => ({ value: '' }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   on('ui.close', () => ({ value: undefined }))
-  on('prompt.submit', ($, e) => {
+  on('ui.toast', () => ({ value: undefined }))
+  on('prompt.submit', async ($, e) => {
+    if (opts.whileQueued !== undefined) await opts.whileQueued()
+    if (opts.noSubmit) return { drop: '发不出去' }
     sent.push(e.text)
     return { text: e.text }
   })
-  on('model.fork', () => ({
-    value: { isAnswered: true as const, text: 'cohort：同一天激活的一批用户', usage: USAGE },
-  }))
+  on('model.fork', () =>
+    opts.noFork
+      ? { deny: '不让问' }
+      : { value: { isAnswered: true as const, text: 'cohort：同一天激活的一批用户', usage: USAGE } },
+  )
   on('model.complete', () => (opts.noHaiku ? { deny: '这个环境没有 haiku' } : {
     value: {
       isAnswered: true as const,
@@ -252,7 +272,7 @@ describe('在回答上批阅', () => {
       surface: 'desktop',
       component: 'Pane',
       requestId: 'red-pen',
-      props: { title: '红笔批阅', isFocused: false, bodyColumns: 60, placement: 'dock' },
+      props: PANE_PROPS,
     })
     const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
     expect(texts).toContain('看不懂词典 · 1 个')
@@ -280,7 +300,9 @@ describe('红笔自动批改', () => {
 
     const ui = await mountReply($, 'desktop', LONG, 'r-fix')
     await ui.press({ key: 'fix-0' })
-    expect(sent.at(-1)).toBe('按红笔改一下上面这条回答：\n- 「cohort」：1 黑话，改成「同一天激活的一批用户」')
+    expect(sent.at(-1)).toBe(
+      `按红笔改一下你之前那条回答（开头是「${plainQuote(LONG, 20)}」）：\n- 「cohort」：1 黑话，改成「同一天激活的一批用户」`,
+    )
     expect((await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')).not.toContain('红笔 1 处')
     await ui.unmount()
   })
@@ -346,11 +368,127 @@ describe('/clear 之后', () => {
       surface: 'desktop',
       component: 'Pane',
       requestId: 'red-pen',
-      props: { title: '红笔批阅', isFocused: false, bodyColumns: 60, placement: 'dock' },
+      props: PANE_PROPS,
     })
     const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
     expect(texts).toContain('批了 6 段')
     expect(texts).toContain('看不懂词典 · 1 个')
+    await pane.unmount()
+  })
+})
+
+describe('复查后补的几处', () => {
+  test('代码块前面没空行时不拆开，代码里的「- xxx」不当列表', () => {
+    const units = splitUnits('改成这样：\n```yaml\nsteps:\n- run: npm i\n- run: npm test\n```\n- 后面的列表照常拆')
+    expect(units.map(u => u.text)).toEqual([
+      '改成这样：\n```yaml\nsteps:\n- run: npm i\n- run: npm test\n```',
+      '- 后面的列表照常拆',
+    ])
+    expect(splitUnits('```diff\n- old line\n+ new line\n```')).toHaveLength(1)
+  })
+
+  test('代码块引第一行代码，表格引第一行内容', () => {
+    expect(plainQuote('```ts\n\nconst a = 1\nconst b = 2\n```')).toBe('代码：const a = 1')
+    expect(plainQuote('| 方案 | **预算** |\n|---|---|\n| A | 1 |')).toBe('表格：方案 / 预算')
+    expect(plainQuote('先看这段：\n```\nnpm test\n```')).toBe('先看这段：（代码：npm test）')
+  })
+
+  test('排队期间：批阅篮已清空，再点「发出」不会重复发，新批的段不会丢', async ($, on) => {
+    const [lead, why] = splitUnits(REPLY)
+    const seen: string[] = []
+    let ui: Reply | undefined
+    const { clock, sent } = world(on, {}, {
+      whileQueued: async () => {
+        if (seen.length > 0) return
+        seen.push(await bandText($, 'desktop'))
+        if (ui !== undefined) await pick(ui, why?.id, 'no')
+      },
+    })
+    await start($)
+    ui = await mountReply($, 'desktop', REPLY, 'q1')
+    await pick(ui, lead?.id, 'ok')
+
+    const band = await $.ui.mount({ plugin: 'red-pen', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await band.press({ key: 'send' })
+    for (let i = 0; i < 20 && sent.length === 0; i++) await clock.settle()
+    await band.unmount()
+    await ui.unmount()
+
+    expect(seen[0]).not.toContain('已批')
+    expect(sent).toEqual(['结论：周末团建改到下周六。——采纳'])
+    expect(await bandText($, 'desktop')).toContain('已批 1 条')
+  })
+
+  test('消息发不出去时，批注放回批阅篮', async ($, on) => {
+    const { sent } = world(on, {}, { noSubmit: true })
+    await start($)
+    const [lead, why] = splitUnits(REPLY)
+    const ui = await mountReply($, 'desktop', REPLY, 'q2')
+    await pick(ui, lead?.id, 'ok')
+    await pick(ui, why?.id, 'no')
+    await ui.unmount()
+
+    const band = await $.ui.mount({ plugin: 'red-pen', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await band.press({ key: 'send' })
+    await band.unmount()
+    expect(sent).toHaveLength(0)
+    expect(await bandText($, 'desktop')).toContain('已批 2 条')
+  })
+
+  test('「啥意思」问不到时显示「没问到」，不会卡在「正在问」', async ($, on) => {
+    world(on, {}, { noFork: true })
+    await start($)
+    const [first] = splitUnits(LONG)
+    const ui = await mountReply($, 'desktop', LONG, 'a1')
+    await pick(ui, first?.id, 'ask')
+    const texts = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Markdown' }))]
+      .map(t => t.text)
+      .join(' ')
+    expect(texts).toContain('没问到')
+    expect(texts).not.toContain('正在问')
+    await ui.unmount()
+  })
+
+  test('正文不到 800 字、或者以代码为主的回答不批', async ($, on) => {
+    const { clock } = world(on)
+    await start($)
+    const codeHeavy = `先看代码。\n\n\`\`\`ts\n${'const value = compute(input)\n'.repeat(80)}\`\`\`\n\n${'说明文字，'.repeat(170)}`
+    for (const [i, answer] of [`${'短一点的回答，'.repeat(60)}`, codeHeavy].entries()) {
+      await $.turn.complete({ answer, durationMs: 1000, isAborted: false, turnId: `s${i}`, reason: 'answer' })
+      await clock.advance(50)
+      await clock.settle()
+      const ui = await mountReply($, 'desktop', answer, `s-${i}`)
+      expect((await ui.findAll({ type: 'Text' })).map(t => t.text).join(' ')).not.toContain('红笔')
+      await ui.unmount()
+    }
+  })
+
+  test('看不懂词典里的词可以逐个删、可以清空', async ($, on) => {
+    world(on, {
+      dict: [
+        { term: 'cohort', explain: '同一天激活的一批用户', at: 2 },
+        { term: 'API', explain: '程序之间的接口', at: 1 },
+      ],
+    })
+    await start($)
+    const pane = await $.ui.mount({ plugin: 'red-pen', surface: 'desktop', component: 'Pane', requestId: 'red-pen', props: PANE_PROPS })
+    await pane.press({ key: 'del-w-API' })
+    let texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+    expect(texts).toContain('看不懂词典 · 1 个')
+    expect(texts).not.toContain('API：')
+    await pane.press({ key: 'clear-dict' })
+    texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+    expect(texts).toContain('看不懂词典 · 0 个')
+    await pane.unmount()
+  })
+
+  test('存档里只认两个开关；门槛跟着插件版本走', async ($, on) => {
+    world(on, { settings: { enabled: true, autoReview: false, minChars: 300 } })
+    await start($)
+    const pane = await $.ui.mount({ plugin: 'red-pen', surface: 'desktop', component: 'Pane', requestId: 'red-pen', props: PANE_PROPS })
+    const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+    expect(texts).toContain('超过 800 字')
+    expect((await pane.find({ key: 't-review' }))?.text).toContain('自动红笔：关')
     await pane.unmount()
   })
 })

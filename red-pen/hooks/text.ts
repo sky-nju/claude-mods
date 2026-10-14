@@ -43,14 +43,16 @@ function splitBlocks(markdown: string): string[] {
   return blocks
 }
 
-// 一块里有顶层列表条目，就按条目拆：条目前的引导句单独一段，缩进的子条目跟着上一条
+// 一块里有顶层列表条目，就按条目拆：条目前的引导句单独一段，缩进的子条目跟着上一条。
+// 逐行看是不是在代码块里：代码块里的「- xxx」（yaml 列表、diff 的删除行）不拆
 function splitItems(block: string): string[] {
-  if (FENCE.test(block)) return [block]
-
   const parts: string[] = []
   let current: string[] = []
+  let inFence = false
   for (const line of block.split('\n')) {
-    if (TOP_ITEM.test(line) && current.length > 0) {
+    if (FENCE.test(line)) {
+      inFence = !inFence
+    } else if (!inFence && TOP_ITEM.test(line) && current.length > 0) {
       parts.push(current.join('\n'))
       current = []
     }
@@ -75,10 +77,23 @@ export function splitUnits(markdown: string): Unit[] {
     })
 }
 
-// 把一段 markdown 压成一行引文：去掉标记，超长截断加「……」
+// 把一段 markdown 压成一行引文：去掉标记，超长截断加「……」。
+// 代码块引第一行代码、表格引第一行内容，批了好几个代码块时 Claude 也分得清是哪个
 export function plainQuote(markdown: string, max = 36): string {
+  const cut = (text: string) => (text.length > max ? `${text.slice(0, max)}……` : text)
+  const lines = markdown.split('\n').filter(line => line.trim() !== '')
+  const first = lines[0] ?? ''
+  if (FENCE.test(first)) {
+    const code = lines.slice(1).find(line => !FENCE.test(line)) ?? ''
+    return cut(`代码：${code.trim()}`)
+  }
+  if (/^\s*\|/.test(first)) {
+    const cells = first.split('|').map(cell => cell.replace(/[*_`]/g, '').trim()).filter(cell => cell !== '')
+    return cut(`表格：${cells.join(' / ')}`)
+  }
+
   const plain = markdown
-    .replace(/```[\s\S]*?(```|$)/g, '（代码）')
+    .replace(/\s*```[^\n]*\n\s*([^\n]*)[\s\S]*?(```|$)/g, (_, code: string) => `（代码：${code.trim()}）`)
     .replace(/^\s*([-*+]|\d+[.)])\s+/gm, '')
     .replace(/^\s*#+\s*/gm, '')
     .replace(/^\s*>\s?/gm, '')
@@ -87,7 +102,12 @@ export function plainQuote(markdown: string, max = 36): string {
     .replace(/\s+/g, ' ')
     .trim()
 
-  return plain.length > max ? `${plain.slice(0, max)}……` : plain
+  return cut(plain)
+}
+
+// 回答里去掉代码块剩下的正文：红笔只批正文，按正文字数判断够不够长、是不是以代码为主
+export function proseOf(answer: string): string {
+  return answer.replace(/^\s*(```|~~~)[\s\S]*?^\s*(```|~~~)\s*$/gm, '（代码块略）')
 }
 
 // 批阅篮拼成平时手打批注的格式：一行一条「原文……——批注」
@@ -126,7 +146,7 @@ export const DEFAULT_RULES = [
 ].join('\n')
 
 export const REVIEW_SYSTEM =
-  '你是中文写作的批改老师。按给定规矩检查一段 AI 写给读者的回答，只挑真正违反规矩、会让读者卡住的地方，最多 3 处；没有就输出 []。只输出 JSON，不要别的字。'
+  '你是中文写作的批改老师。按给定规矩检查一段 AI 写给读者的回答，只挑真正违反规矩、会让读者卡住的地方，最多 3 处；没有就输出 []。文件名、路径、命令、代码、链接和产品名不算黑话，不要挑。只输出 JSON，不要别的字。'
 
 export function reviewPrompt(answer: string, dismissed: readonly string[]): string {
   const skip =

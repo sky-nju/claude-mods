@@ -16,6 +16,7 @@ import {
   parseFindings,
   parseTerms,
   plainQuote,
+  proseOf,
   readerSection,
   reviewPrompt,
   splitUnits,
@@ -27,8 +28,12 @@ const REVIEW_MODEL = 'haiku'
 // 规矩文件：先找当前目录的，再找自己 home 下的；都没有就用内置的
 const RULES_FILE = '.claude/red-pen-rules.md'
 
+// 「啥意思」问了这么久还没回来，就当没问到（比如问的过程中插件被重新加载了）
+const ASK_TIMEOUT_MS = 60_000
+
 const EMPTY_BLOCK: PenBlock = { marks: {}, explains: {}, editing: '' }
-const DEFAULT_SETTINGS: PenSettings = { enabled: true, autoReview: true, minChars: 300 }
+// 门槛按去掉代码块后的正文字数算
+const DEFAULT_SETTINGS: PenSettings = { enabled: true, autoReview: true, minChars: 800 }
 
 const blocks = atom({ plugin: 'red-pen', key: 'blocks' } as const, EMPTY_BLOCK)
 const basket = atom({ plugin: 'red-pen', key: 'basket' } as const, [] as PenBasketItem[])
@@ -53,17 +58,27 @@ async function stored<T>($: EngineInterface, key: string, fallback: T): Promise<
 }
 
 // 记一次使用：当天的数进会话状态（面板读），同时存 30 天到 $.store。
-// 会话状态被 /clear 清掉时，从存档接着数，不从 0 重来
+// 以存档为准接着数：/clear 清掉会话状态、或者另一个会话也在数，都不会互相覆盖
 async function count($: EngineInterface, field: Counter, n = 1, rule?: string): Promise<void> {
   const date = dayOf(await $.clock.now())
-  const saved = (await stored<PenDayStats[]>($, 'days', [])).find(d => d.date === date)
+  const days = await stored<PenDayStats[]>($, 'days', [])
+  const saved = days.find(d => d.date === date)
   const day = await update($, today, old => {
-    const base = old.date === date ? old : (saved ?? emptyDay(date))
+    const base = saved ?? (old.date === date ? old : emptyDay(date))
     const byRule = rule === undefined ? base.byRule : { ...base.byRule, [rule]: (base.byRule[rule] ?? 0) + n }
     return { ...base, [field]: base[field] + n, byRule }
   })
-  const days = await stored<PenDayStats[]>($, 'days', [])
   await $.store.set('days', [day, ...days.filter(d => d.date !== day.date)].slice(0, 30))
+}
+
+// 词典的增删都在最新存档上做，两个会话同时开着也不会把对方加的词冲掉
+async function changeDict(
+  $: EngineInterface,
+  change: (old: PenDictEntry[]) => PenDictEntry[],
+): Promise<void> {
+  const next = change(await stored<PenDictEntry[]>($, 'dict', []))
+  await $.store.set('dict', next)
+  await update($, dict, () => next)
 }
 
 async function loadRules($: EngineInterface, cwd: string): Promise<void> {
@@ -85,7 +100,7 @@ async function loadRules($: EngineInterface, cwd: string): Promise<void> {
 // 会话开始（含 /clear、/resume）：读回设置、词典、统计，算好写进系统提示的那一段
 async function restore($: EngineInterface, cwd: string): Promise<void> {
   const saved = await stored<Partial<PenSettings>>($, 'settings', {})
-  await update($, settings, () => ({ ...DEFAULT_SETTINGS, ...saved }))
+  await update($, settings, () => ({ ...DEFAULT_SETTINGS, ...switches(saved) }))
   const words = await stored<PenDictEntry[]>($, 'dict', [])
   await update($, dict, () => words)
   const days = await stored<PenDayStats[]>($, 'days', [])
@@ -95,9 +110,22 @@ async function restore($: EngineInterface, cwd: string): Promise<void> {
   await loadRules($, cwd)
 }
 
+// 存档里只记两个开关；门槛跟着插件版本走，升级后改了默认值也能生效
+function switches(saved: Partial<PenSettings> | undefined): Partial<PenSettings> {
+  if (saved === undefined) return {}
+  const picked: Partial<PenSettings> = {}
+  if (typeof saved.enabled === 'boolean') picked.enabled = saved.enabled
+  if (typeof saved.autoReview === 'boolean') picked.autoReview = saved.autoReview
+
+  return picked
+}
+
+// 在最新存档上改开关，另一个会话改过的那个开关不会被这边改回去
 async function saveSettings($: EngineInterface, change: (old: PenSettings) => PenSettings): Promise<void> {
-  const next = await update($, settings, change)
-  await $.store.set('settings', next)
+  const latest = { ...DEFAULT_SETTINGS, ...switches(await stored<Partial<PenSettings>>($, 'settings', {})) }
+  const next = change(latest)
+  await $.store.set('settings', switches(next))
+  await update($, settings, () => next)
 }
 
 // 给一段定下批阅结论（null 是撤回），批阅篮跟着改
@@ -154,15 +182,40 @@ async function clearBasket($: EngineInterface): Promise<void> {
   await update($, allAccept, () => false)
 }
 
-// 拼成「原文……——批注」，以你自己的名义发出一轮，然后清空批阅篮
+// 以你自己的名义发出一轮；被拒绝或被丢弃都算没发出去
+async function submitted($: EngineInterface, text: string): Promise<boolean> {
+  const result = await $.prompt.submit({ text, asUser: true }).catch(() => undefined)
+
+  return result !== undefined && result.drop === undefined
+}
+
+// 发不出去时，把这批条目和段落上的标记放回去
+async function putBack($: EngineInterface, items: readonly PenBasketItem[]): Promise<void> {
+  for (const item of items) {
+    await update($, memberOf(blocks, { requestId: item.requestId }), block => ({
+      ...block,
+      marks: { ...block.marks, [item.unitId]: { verdict: item.verdict, note: item.note } },
+    }))
+  }
+  await update($, basket, list => [...items, ...list.filter(one => !items.some(item => item.key === one.key))])
+}
+
+// 拼成「原文……——批注」，以你自己的名义发出一轮。
+// 先把这批条目拿出批阅篮再发：Claude 正在回答时消息要排队，这期间再点不会重复发，新批的段也留在篮子里
 async function send($: EngineInterface): Promise<void> {
   const items = await read($, basket)
   if (items.length === 0) return
   const text = composeMessage(items, await read($, allAccept))
-  await $.prompt.submit({ text, asUser: true })
   await clearBasket($)
-  await count($, 'sent')
   await $.ui.close({ id: PANE }).catch(() => undefined)
+  $.ui.toast(`已发出 ${items.length} 条批注；Claude 正在回答的话，会等这轮答完再处理`)
+  const sentOk = await submitted($, text)
+  if (!sentOk) {
+    await putBack($, items)
+    $.ui.toast('批注没发出去，已放回批阅篮')
+    return
+  }
+  await count($, 'sent')
 }
 
 // 「啥意思」：带着整段对话旁路问一句，答案只画在这段下面，不进主对话；问到的词进词典
@@ -176,39 +229,51 @@ async function ask($: EngineInterface, requestId: string, unit: Unit): Promise<v
       return { ...block, explains, open: '' }
     })
 
+  // 已经有解释（或正在问）时再点就是收起；正在问时收起，问回来的答案也不再显示
   const current = (await read($, member)).explains[unit.id]
-  if (current?.status === 'asking') return
   if (current !== undefined) {
     await setExplain(null)
     return
   }
 
-  await setExplain({ status: 'asking', text: '' })
-  const reply = await $.model.fork({ prompt: EXPLAIN_PROMPT + unit.text })
-  if (!reply.isAnswered) {
-    const why = reply.reason === 'nothing-to-fork' ? '这个会话还没有可以旁路提问的内容' : `没问到（${reply.reason}）`
+  const ticket = await $.clock.now()
+  await setExplain({ status: 'asking', text: '', ticket })
+  const reply = await $.model.fork({ prompt: EXPLAIN_PROMPT + unit.text }).catch(() => undefined)
+  const still = (await read($, member)).explains[unit.id]
+  if (still?.status !== 'asking' || still.ticket !== ticket) return
+
+  if (reply === undefined || !reply.isAnswered) {
+    const why =
+      reply === undefined
+        ? '没问到，可以再点一次「啥意思」试试'
+        : reply.reason === 'nothing-to-fork'
+          ? '这个会话还没有可以旁路提问的内容'
+          : `没问到（${reply.reason}）`
     await setExplain({ status: 'failed', text: why })
     return
   }
 
   await setExplain({ status: 'done', text: reply.text.trim() })
   const fresh = parseTerms(reply.text, await $.clock.now())
-  if (fresh.length > 0) {
-    const merged = mergeDict(await read($, dict), fresh)
-    await update($, dict, () => merged)
-    await $.store.set('dict', merged)
-  }
+  if (fresh.length > 0) await changeDict($, old => mergeDict(old, fresh))
   await count($, 'explains')
 }
 
-// 一轮结束后，长回答用小模型按规矩批一遍
+async function removeWord($: EngineInterface, term: string): Promise<void> {
+  await changeDict($, old => old.filter(entry => entry.term !== term))
+}
+
+// 一轮结束后，长回答用小模型按规矩批一遍。只批正文：代码块不算字数、也不发给小模型；
+// 正文不到门槛、或者一半以上是代码的回答不批
 async function reviewAnswer($: EngineInterface, answer: string): Promise<void> {
   const conf = await read($, settings)
-  if (!conf.autoReview || answer.length < conf.minChars) return
+  const prose = proseOf(answer)
+  if (!conf.autoReview || prose.length < conf.minChars || prose.length < answer.length / 2) return
 
   const id = hash(answer)
   const at = await $.clock.now()
-  const fresh: PenReview = { id, norm: normalize(answer), status: 'checking', findings: [], at }
+  const head = plainQuote(answer, 20)
+  const fresh: PenReview = { id, head, norm: normalize(answer), status: 'checking', findings: [], at }
   await update($, reviews, list => [fresh, ...list.filter(review => review.id !== id)].slice(0, 20))
 
   const dismissed = await stored<string[]>($, 'dismissed', [])
@@ -217,14 +282,14 @@ async function reviewAnswer($: EngineInterface, answer: string): Promise<void> {
     .complete({
       model: REVIEW_MODEL,
       system: REVIEW_SYSTEM,
-      prompt: [{ text: `规矩：\n${rules}`, cache: true }, { text: reviewPrompt(answer, dismissed) }],
+      prompt: [{ text: `规矩：\n${rules}`, cache: true }, { text: reviewPrompt(prose, dismissed) }],
       maxTokens: 800,
       effort: 'low',
       timeoutMs: 30_000,
     })
     .catch(() => undefined)
   const isAnswered = reply !== undefined && reply.isAnswered
-  const findings = isAnswered ? parseFindings(reply.text, answer) : []
+  const findings = isAnswered ? parseFindings(reply.text, prose) : []
   const status: PenReview['status'] = isAnswered ? 'done' : 'failed'
   await update($, reviews, list =>
     list.map(review => (review.id === id ? { ...review, status, findings } : review)),
@@ -243,14 +308,23 @@ async function applyFindings($: EngineInterface, reviewId: string, indexes: read
     const finding = review.findings[i]
     return finding === undefined ? '' : `- 「${finding.quote}」：${finding.rule}，${finding.fix}`
   })
-  await $.prompt.submit({ text: ['按红笔改一下上面这条回答：', ...lines].join('\n'), asUser: true })
-  await update($, reviews, list =>
-    list.map(one =>
-      one.id !== reviewId
-        ? one
-        : { ...one, findings: one.findings.map((f, i) => (picked.includes(i) ? { ...f, state: 'applied' as const } : f)) },
-    ),
-  )
+  const which = review.head === undefined || review.head === '' ? '你之前那条回答' : `你之前那条回答（开头是「${review.head}」）`
+
+  // 先标成已改再发：Claude 正在回答时消息要排队，这期间再点不会重复发
+  const mark = (state: 'open' | 'applied') =>
+    update($, reviews, list =>
+      list.map(one =>
+        one.id !== reviewId
+          ? one
+          : { ...one, findings: one.findings.map((f, i) => (picked.includes(i) ? { ...f, state } : f)) },
+      ),
+    )
+  await mark('applied')
+  if (!(await submitted($, [`按红笔改一下${which}：`, ...lines].join('\n')))) {
+    await mark('open')
+    $.ui.toast('修改要求没发出去，可以再点一次「照改」')
+    return
+  }
   await count($, 'applied', picked.length)
 }
 
@@ -341,6 +415,7 @@ export const register: Register = on => {
     const member = memberOf(blocks, e)
     const block = conf.enabled ? await read($, member) : EMPTY_BLOCK
     const units = conf.enabled ? splitUnits(e.props.text) : [{ id: 'all', text: e.props.text }]
+    const now = await $.clock.now()
 
     const say = (mark: PenMark) =>
       mark.verdict === 'ok' ? '采纳' : mark.verdict === 'no' ? '不要' : `批注：${mark.note}`
@@ -355,6 +430,13 @@ export const register: Register = on => {
       const explain = block.explains[unit.id]
       const isEditing = block.editing === unit.id
       const isOpen = block.open === unit.id
+      const isStuck = explain?.status === 'asking' && now - (explain.ticket ?? 0) > ASK_TIMEOUT_MS
+      const explainHead =
+        explain?.status !== 'asking'
+          ? '啥意思：'
+          : isStuck
+            ? '啥意思：等了太久没回来。点「✎」→「收起解释」，再点「啥意思」重问'
+            : '啥意思：正在问…'
 
       return (
         <Box key={`u-${unit.id}`} flexDirection="column">
@@ -375,7 +457,7 @@ export const register: Register = on => {
           {mark !== undefined && <Text color="error">{`  ✎ ${say(mark)}`}</Text>}
           {explain !== undefined && (
             <Box flexDirection="column" paddingLeft={2}>
-              <Text dimColor>{explain.status === 'asking' ? '啥意思：正在问…' : '啥意思：'}</Text>
+              <Text dimColor>{explainHead}</Text>
               {explain.status !== 'asking' && <Markdown text={explain.text} dimColor />}
             </Box>
           )}
@@ -579,20 +661,24 @@ export const register: Register = on => {
             />
           </Box>
           <Text dimColor wrap="truncate-end">
-            规矩来自：{from} · 超过 {conf.minChars} 字的回答才批
+            规矩来自：{from} · 去掉代码后正文超过 {conf.minChars} 字的回答才批
           </Text>
         </Box>
 
         <Box flexDirection="column">
           <Text bold>看不懂词典 · {words.length} 个</Text>
-          {words.length === 0 && (
-            <Text dimColor>点过「啥意思」的词会记在这里，下次开会话时提醒 Claude 少用，或者先解释。</Text>
-          )}
-          {words.slice(0, 12).map(word => (
-            <Text wrap="truncate-end">
-              {word.term}：{word.explain}
-            </Text>
+          <Text dimColor>最近的 30 个词会在新会话开始时告诉 Claude：少用，或者先解释。记错的词可以删掉。</Text>
+          {words.slice(0, 30).map(word => (
+            <Box key={`w-${word.term}`} gap={1}>
+              <Text wrap="truncate-end">
+                {word.term}：{word.explain}
+              </Text>
+              <Button key={`del-w-${word.term}`} label="删掉" dimColor onPress={() => void removeWord($, word.term)} />
+            </Box>
           ))}
+          {words.length > 0 && (
+            <Button key="clear-dict" label="清空词典" dimColor onPress={() => void changeDict($, () => [])} />
+          )}
         </Box>
       </Box>
     )

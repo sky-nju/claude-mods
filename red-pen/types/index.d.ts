@@ -3,7 +3,7 @@ export type PenVerdict = 'ok' | 'no' | 'note'
 export type PenMark = { verdict: PenVerdict; note: string }
 
 // 「啥意思」的解释，问的时候是 asking
-export type PenExplain = { status: 'asking' | 'done' | 'failed'; text: string }
+export type PenExplain = { status: 'asking' | 'done' | 'failed'; text: string; ticket?: number }
 
 // 一条回答（一个 requestId）上各段的批阅状态，键是段落 id；
 // open 是点了「✎」展开工具栏的那一段，editing 是正在写批注的那一段
@@ -36,6 +36,7 @@ export type PenFinding = {
 // 一条长回答的红笔结果，norm 是去掉空白的回答原文，用来对上画面里的那条回答
 export type PenReview = {
   id: string
+  head?: string
   norm: string
   status: 'checking' | 'done' | 'failed'
   findings: PenFinding[]
