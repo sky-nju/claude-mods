@@ -188,6 +188,17 @@ export function parseFindings(reply: string, answer: string): PenFinding[] {
 export const EXPLAIN_PROMPT =
   '（这是红笔批阅插件的旁路提问，你的回答不会进入对话。）读者看不懂下面这段里的一些说法。请结合上面的对话，用大白话解释这段里普通人可能看不懂的词、缩写、代号或编号，每个一行，格式「词：解释」，解释不超过 25 字，最多 5 个。没有就只回「没有难懂的词」。\n\n这段是：\n'
 
+// 解释有好几行时排成列表：Markdown 会把单个换行当空格，不排的话几个词会挤成一段
+export function explainMarkdown(reply: string): string {
+  const lines = reply
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line !== '')
+  if (lines.length <= 1) return lines[0] ?? ''
+
+  return lines.map(line => (/^([-*+]|\d+[.)])\s/.test(line) ? line : `- ${line}`)).join('\n')
+}
+
 // 「词：解释」一行一个，抽出来进词典
 export function parseTerms(reply: string, at: number): PenDictEntry[] {
   const entries: PenDictEntry[] = []

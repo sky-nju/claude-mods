@@ -4,6 +4,7 @@ import type { On } from 'claude-code'
 
 import {
   composeMessage,
+  explainMarkdown,
   parseFindings,
   parseTerms,
   plainQuote,
@@ -490,5 +491,14 @@ describe('复查后补的几处', () => {
     expect(texts).toContain('超过 800 字')
     expect((await pane.find({ key: 't-review' }))?.text).toContain('自动红笔：关')
     await pane.unmount()
+  })
+})
+
+describe('截图里看到的', () => {
+  test('「啥意思」好几个词时排成列表，不挤成一段', () => {
+    expect(explainMarkdown('Claude Code：写代码的 AI 助手\nnpm：装软件的公共下载站\n\n- 2.1.299：版本号')).toBe(
+      '- Claude Code：写代码的 AI 助手\n- npm：装软件的公共下载站\n- 2.1.299：版本号',
+    )
+    expect(explainMarkdown('  没有难懂的词  ')).toBe('没有难懂的词')
   })
 })

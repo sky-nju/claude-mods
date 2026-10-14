@@ -9,6 +9,7 @@ import {
   composeMessage,
   dayOf,
   emptyDay,
+  explainMarkdown,
   hash,
   matchesAnswer,
   mergeDict,
@@ -253,7 +254,7 @@ async function ask($: EngineInterface, requestId: string, unit: Unit): Promise<v
     return
   }
 
-  await setExplain({ status: 'done', text: reply.text.trim() })
+  await setExplain({ status: 'done', text: explainMarkdown(reply.text) })
   const fresh = parseTerms(reply.text, await $.clock.now())
   if (fresh.length > 0) await changeDict($, old => mergeDict(old, fresh))
   await count($, 'explains')
