@@ -44,17 +44,21 @@ type Counter = Exclude<keyof PenDayStats, 'date' | 'byRule'>
 
 // 规矩全文只给红笔批改用，不进界面，放模块变量；重新加载时 session.start 会再读一次
 let rules = DEFAULT_RULES
+// 会话所在目录：/clear 之后补读规矩文件要用
+let sessionCwd = ''
 
 async function stored<T>($: EngineInterface, key: string, fallback: T): Promise<T> {
   const value = await $.store.get(key).catch(() => undefined)
   return value === undefined ? fallback : (value as T)
 }
 
-// 记一次使用：当天的数进会话状态（面板读），同时存 30 天到 $.store
+// 记一次使用：当天的数进会话状态（面板读），同时存 30 天到 $.store。
+// 会话状态被 /clear 清掉时，从存档接着数，不从 0 重来
 async function count($: EngineInterface, field: Counter, n = 1, rule?: string): Promise<void> {
   const date = dayOf(await $.clock.now())
+  const saved = (await stored<PenDayStats[]>($, 'days', [])).find(d => d.date === date)
   const day = await update($, today, old => {
-    const base = old.date === date ? old : emptyDay(date)
+    const base = old.date === date ? old : (saved ?? emptyDay(date))
     const byRule = rule === undefined ? base.byRule : { ...base.byRule, [rule]: (base.byRule[rule] ?? 0) + n }
     return { ...base, [field]: base[field] + n, byRule }
   })
@@ -280,16 +284,22 @@ export const register: Register = on => {
         description: '红笔批阅：打开面板，看批阅篮、今天的次数、看不懂词典，开关段落按钮和自动红笔',
       })
       .catch(() => undefined)
+    sessionCwd = e.cwd
     await restore($, e.cwd).catch(() => undefined)
 
     return next(e)
   })
 
-  // /clear、/resume、/branch 不会再触发 session.start，这里补读一次
-  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    await restore($, e.cwd).catch(() => undefined)
+  // /clear、/resume 会把会话状态清回默认值，而且不会再触发 session.start。
+  // 有公司统一配置时，内置守卫会跳过用户 mod 的 classic.SessionStart，
+  // 所以在会话结束时预约一次补读，等状态清空之后再读回来
+  on('session.end', async ($, e, next) => {
+    const result = await next(e)
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      $.clock.after(500, () => void restore($, sessionCwd).catch(() => undefined))
+    }
 
-    return next(e)
+    return result
   })
 
   on('command.run', { command: 'redpen' }, async $ => {

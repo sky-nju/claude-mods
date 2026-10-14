@@ -325,3 +325,32 @@ describe('读者档案进系统提示', () => {
     expect(result.sections.map(s => s.id)).toEqual(['intro'])
   })
 })
+
+describe('/clear 之后', () => {
+  test('统计、词典接着用，不从 0 重来', async ($, on) => {
+    // 每个测试开始时 $.state 都是默认值，和 /clear 之后一样；存档还在 $.store 里
+    const day = { date: '2026-10-14', marks: 5, sent: 1, explains: 0, reviews: 0, findings: 0, applied: 0, dismissed: 0, byRule: {} }
+    const { clock } = world(on, { days: [day], dict: [{ term: 'cohort', explain: '同一天激活的一批用户', at: 1 }] })
+    on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+    await clock.advance(1000)
+    await clock.settle()
+
+    const [lead] = splitUnits(REPLY)
+    const ui = await mountReply($, 'desktop', REPLY, 'c1')
+    await pick(ui, lead?.id, 'ok')
+    await ui.unmount()
+
+    const pane = await $.ui.mount({
+      plugin: 'red-pen',
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: 'red-pen',
+      props: { title: '红笔批阅', isFocused: false, bodyColumns: 60, placement: 'dock' },
+    })
+    const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text).join(' ')
+    expect(texts).toContain('批了 6 段')
+    expect(texts).toContain('看不懂词典 · 1 个')
+    await pane.unmount()
+  })
+})

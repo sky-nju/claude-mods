@@ -29,7 +29,7 @@ claude plugin install red-pen --marketplace sky-nju/claude-mods
 **更新**：
 
 ```bash
-claude plugin marketplace update sky-mods
+claude plugin marketplace update sky-claude-mods
 ```
 
 然后在会话里输入 `/reload-plugins`，或者新开一个会话。
